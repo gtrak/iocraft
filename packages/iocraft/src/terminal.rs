@@ -262,6 +262,12 @@ impl<'a> Terminal<'a> {
         self.inner.print_above(messages)
     }
 
+    /// Stashes the hardware cursor position the app declares for subsequent
+    /// frames (see [`TerminalBackend::set_cursor_position`]).
+    pub fn set_cursor_position(&mut self, position: Option<(u16, u16)>) {
+        self.inner.set_cursor_position(position);
+    }
+
     /// Wraps a series of terminal updates in a synchronized update block, making sure to end the
     /// synchronized update even if there is an error or panic.
     pub fn synchronized_update<F>(&mut self, f: F) -> io::Result<()>

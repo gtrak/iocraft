@@ -353,6 +353,11 @@ pub(crate) struct CrosstermBackend<'a> {
     /// there is only one physical cursor, so output from different hooks
     /// interleaves the same way plain `print!`/`println!` calls would.
     passthrough_appended_newline: Option<u16>,
+    /// The hardware cursor position declared by the app via
+    /// [`Self::set_cursor_position`]. While set, it is emitted at the end
+    /// of every frame (after the canvas's own cursor park, before the
+    /// `?2026l` close) — see `emit_cursor_position`.
+    cursor_position: Option<(u16, u16)>,
 }
 
 impl CrosstermBackend<'_> {
@@ -509,6 +514,10 @@ impl TerminalBackend for CrosstermBackend<'_> {
             }
         }
         Ok(())
+    }
+
+    fn set_cursor_position(&mut self, position: Option<(u16, u16)>) {
+        self.cursor_position = position;
     }
 
     fn clear_canvas(&mut self) -> io::Result<()> {
@@ -675,6 +684,11 @@ impl TerminalBackend for CrosstermBackend<'_> {
     }
 
     fn end_frame(&mut self) -> io::Result<()> {
+        // The app-declared cursor (if any) rides at the end of EVERY frame —
+        // after the canvas write (including its own cursor park), before the
+        // close — even on frames that rewrote no canvas, so the CUP is the
+        // frame's final cursor movement by program order.
+        self.emit_cursor_position()?;
         self.dest.execute(terminal::EndSynchronizedUpdate)?;
         Ok(())
     }
@@ -763,9 +777,26 @@ impl<'a> CrosstermBackend<'a> {
             size: None,
             prev_size_on_write: None,
             passthrough_appended_newline: None,
+            cursor_position: None,
         };
         term.dest.queue(cursor::Hide)?;
         Ok(term)
+    }
+
+    /// Emits the app-declared hardware cursor position (show + move), if
+    /// one is set. Called from `end_frame` — after the canvas write (and its
+    /// own cursor park) and before the `?2026l` close — so the app's CUP is
+    /// the last cursor movement of the frame, from the same writer, by
+    /// program order. It runs on every frame, including frames that
+    /// rewrote no canvas at all (a point move in a view whose canvas is
+    /// visually unchanged): those frames have no park of their own, but the
+    /// cursor still has to follow the declared position. Nothing is
+    /// emitted when no position is set (stock 0.9.1 behavior).
+    fn emit_cursor_position(&mut self) -> io::Result<()> {
+        if let Some((col, row)) = self.cursor_position {
+            self.dest.queue(cursor::Show)?.queue(cursor::MoveTo(col, row))?;
+        }
+        Ok(())
     }
 
     fn set_raw_mode_enabled(&mut self, raw_mode_enabled: bool) -> io::Result<()> {
@@ -1366,6 +1397,7 @@ mod tests {
             size: None,
             prev_size_on_write: None,
             passthrough_appended_newline: None,
+            cursor_position: None,
         }
     }
 
@@ -1393,6 +1425,7 @@ mod tests {
             size: Some(term_size),
             prev_size_on_write: None,
             passthrough_appended_newline: None,
+            cursor_position: None,
         }
     }
 
@@ -2059,5 +2092,82 @@ mod tests {
         assert_eq!(vt.line(2).text(), "row2      ");
         assert_eq!(vt.line(3).text(), "row3      ");
         assert_eq!(vt.line(4).text(), "FOOTER    ");
+    }
+
+    /// Vendored patch (redline 013-02): when no cursor position is set,
+    /// frames emit no cursor Show (`ESC[?25h`) at all — stock 0.9.1 bytes.
+    /// When a position IS set, the Show + CUP pair rides at the end of
+    /// EVERY frame (including frames that rewrote no canvas) — after the
+    /// canvas park, before the `?2026l` close — as the frame's last cursor
+    /// movement.
+    #[test]
+    fn cursor_position_unset_is_noop_and_set_emits_at_frame_end() {
+        let (prev, next) = make_fullscreen_diff_canvases(2);
+
+        // Unset: the full frame (write + close) carries no cursor Show, and
+        // the diff frame ends at the park, then the close — 5-row canvas →
+        // row 5, 1-based, column 1.
+        let (dest, buf) = new_test_writer();
+        let mut term = new_fullscreen_term(dest, 0, prev.height() as _);
+        term.write_canvas(Some(&prev), &next).unwrap();
+        term.end_frame().unwrap();
+        let unset = buf.lock().unwrap().clone();
+        assert!(
+            !unset.windows(6).any(|w| w == b"\x1b[?25h"),
+            "unset frame must contain no cursor Show: {unset:?}"
+        );
+        assert!(
+            unset.ends_with(b"\x1b[5;1H\x1b[?2026l"),
+            "unset frame ends at the park, then the close: {unset:?}"
+        );
+
+        // Set: identical frame bytes up to the park, then Show +
+        // MoveTo(3, 2) → 1-based `3;4H`, then the close.
+        let (dest, buf) = new_test_writer();
+        let mut term = new_fullscreen_term(dest, 0, prev.height() as _);
+        term.set_cursor_position(Some((3, 2)));
+        term.write_canvas(Some(&prev), &next).unwrap();
+        term.end_frame().unwrap();
+        let set = buf.lock().unwrap().clone();
+        let park = b"\x1b[5;1H";
+        let set_at_park = set
+            .windows(park.len())
+            .position(|w| w == park)
+            .expect("park present in the set frame");
+        assert_eq!(
+            &set[set_at_park + park.len()..],
+            b"\x1b[?25h\x1b[3;4H\x1b[?2026l",
+            "Show + CUP after the park, before the close"
+        );
+        // The emit (`?25h` + `3;4H`) is 12 bytes and the close (`?2026l`)
+        // 8: with the emit stripped from the set frame, every byte up to
+        // and including the park must be identical (the patch changes
+        // nothing else).
+        assert_eq!(
+            &set[..set_at_park + park.len()],
+            &unset[..unset.len() - 8],
+            "frame bytes up to and including the park are unchanged by the patch"
+        );
+
+        // A frame that rewrote NO canvas (point moved, canvas visually
+        // unchanged): the CUP still rides the close. This is exactly the
+        // case a write_canvas-only emit would miss.
+        let (dest, buf) = new_test_writer();
+        let mut term = new_fullscreen_term(dest, 0, prev.height() as _);
+        term.set_cursor_position(Some((1, 0)));
+        term.end_frame().unwrap();
+        let nochange = buf.lock().unwrap().clone();
+        assert_eq!(
+            nochange,
+            b"\x1b[?25h\x1b[1;2H\x1b[?2026l",
+            "no-change frame still ends Show + CUP + close: {nochange:?}"
+        );
+
+        // Unset + no-change: stock bytes (the close only).
+        let (dest, buf) = new_test_writer();
+        let mut term = new_fullscreen_term(dest, 0, prev.height() as _);
+        term.end_frame().unwrap();
+        let nochange_unset = buf.lock().unwrap().clone();
+        assert_eq!(nochange_unset, b"\x1b[?2026l");
     }
 }

@@ -142,6 +142,22 @@ pub trait TerminalBackend: Send {
         Ok(())
     }
 
+    /// Stashes the hardware cursor position the app declares, or clears it.
+    ///
+    /// While set, the backend shows and moves the hardware cursor to that
+    /// position at the end of every frame — after the canvas's own cursor
+    /// park, before the frame close (including frames that rewrote no
+    /// canvas) — so the app's cursor position is the last cursor movement
+    /// of the frame, ordered by program, not by a timing bet between two
+    /// writers. When `None`, the backend emits nothing (its stock
+    /// behavior).
+    ///
+    /// The default implementation is a no-op, for backends without a
+    /// hardware cursor.
+    fn set_cursor_position(&mut self, position: Option<(u16, u16)>) {
+        let _ = position;
+    }
+
     /// Brackets the start of a frame so partial updates aren't shown (e.g. a
     /// DEC 2026 synchronized update on ANSI terminals).
     ///
